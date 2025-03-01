@@ -1,0 +1,43 @@
+# Ignore Python bytecode files
+*.pyc
+*.pyo
+__pycache__/
+
+# Virtual environment directories
+venv/
+env/
+
+# Django stuff:
+*.log
+*.pot
+*.pyc
+*.pyo
+__pycache__/
+
+# Ignore Django migrations
+*/migrations/*
+
+# Ignore database files
+*.sqlite3
+
+# Ignore static and media files (if not committed)
+static/
+media/
+
+# Ignore environment variables file (if you're using .env for sensitive data)
+.env
+
+# Ignore IDE/editor-specific files (for example, VS Code, PyCharm)
+.vscode/
+.idea/
+
+# Ignore Docker-related files
+docker-compose.override.yml
+Dockerfile
+*.log
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore local settings file
+local_settings.py
