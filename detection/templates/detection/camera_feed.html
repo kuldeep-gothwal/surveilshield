@@ -1,0 +1,26 @@
+<!-- templates/detection/camera_feed.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Mac Camera Live Feed</title>
+  <style>
+    .feed-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      margin-top: 40px;
+    }
+    .feed-container img {
+      border: 2px solid #333;
+      max-width: 80%;
+    }
+  </style>
+</head>
+<body>
+  <div class="feed-container">
+    <h1>Live Camera Feed</h1>
+    <img src="{% url 'camera_feed' %}" alt="Camera Feed">
+  </div>
+</body>
+</html>
