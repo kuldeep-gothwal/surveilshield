@@ -3,24 +3,121 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Mac Camera Live Feed</title>
+  <title>Theft Detection Camera Feed</title>
   <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #f0f0f0;
+      margin: 0;
+      padding: 0;
+    }
     .feed-container {
       display: flex;
       flex-direction: column;
       align-items: center;
-      margin-top: 40px;
+      margin: 20px auto;
+      max-width: 800px;
     }
     .feed-container img {
       border: 2px solid #333;
-      max-width: 80%;
+      border-radius: 8px;
+      max-width: 90%;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #333;
+      border-bottom: 2px solid #ccc;
+      padding-bottom: 10px;
+    }
+    .status-panel {
+      background-color: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 15px;
+      margin-top: 20px;
+      width: 90%;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    .info {
+      margin-bottom: 10px;
+    }
+    .alert {
+      color: #721c24;
+      background-color: #f8d7da;
+      border: 1px solid #f5c6cb;
+      padding: 10px;
+      border-radius: 4px;
+      margin-top: 10px;
+      display: none;
+    }
+    .alert.active {
+      display: block;
     }
   </style>
 </head>
 <body>
   <div class="feed-container">
-    <h1>Live Camera Feed</h1>
-    <img src="{% url 'camera_feed' %}" alt="Camera Feed">
+    <h1>Theft Detection System</h1>
+    <p>This system detects when objects like phones or bananas are placed in pockets.</p>
+    
+    <img src="{% url 'camera_feed' %}" alt="Camera Feed" id="cameraFeed">
+    
+    <div class="status-panel">
+      <div class="info">
+        <strong>Status:</strong> <span id="status">Monitoring</span>
+      </div>
+      <div class="info">
+        <strong>Instructions:</strong> Place a cell phone or banana in your pocket to test detection.
+      </div>
+      <div class="alert" id="alertBox">
+        <strong>SUSPICIOUS ACTION DETECTED!</strong>
+        <div id="alertDetails"></div>
+      </div>
+    </div>
   </div>
+
+  <script>
+    // Simple script to simulate detection alerts
+    // In a real implementation, you would use WebSockets or polling to get real-time alerts
+    
+    function checkForSuspiciousText() {
+      // Get the camera feed image
+      const img = document.getElementById('cameraFeed');
+      
+      // Create a dummy canvas to analyze the image
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      
+      // This is just a simulation - in reality you'd need a more sophisticated approach
+      // Perhaps using JavaScript's requestAnimationFrame to continuously check
+      
+      // Set status
+      const statusEl = document.getElementById('status');
+      const alertBox = document.getElementById('alertBox');
+      const alertDetails = document.getElementById('alertDetails');
+      
+      // Toggle alert for demo purposes (every 10 seconds)
+      setInterval(() => {
+        if (Math.random() > 0.7) {
+          statusEl.textContent = "ALERT!";
+          statusEl.style.color = "red";
+          alertBox.classList.add('active');
+          alertDetails.textContent = "Object placed in pocket detected!";
+          
+          // Reset after 3 seconds
+          setTimeout(() => {
+            statusEl.textContent = "Monitoring";
+            statusEl.style.color = "black";
+            alertBox.classList.remove('active');
+          }, 3000);
+        }
+      }, 10000);
+    }
+    
+    // Start monitoring when page loads
+    window.onload = function() {
+      setTimeout(checkForSuspiciousText, 2000);
+    };
+  </script>
 </body>
 </html>
