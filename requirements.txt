@@ -43,6 +43,7 @@ mediapipe==0.10.21
 ml-dtypes==0.4.1
 mpmath==1.3.0
 msgpack==1.1.0
+mysqlclient==2.2.7
 namex==0.0.8
 networkx==3.4.2
 numpy==1.26.4
