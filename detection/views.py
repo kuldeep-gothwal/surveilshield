@@ -1,5 +1,3 @@
-# detection/views.py
-
 import cv2
 import time
 import os
@@ -22,7 +20,6 @@ def camera_page(request):
     """
     return render(request, 'detection/camera_feed.html')
 
-
 def camera_feed(request):
     """
     Streams annotated frames from your Mac's built-in camera.
@@ -30,9 +27,11 @@ def camera_feed(request):
     hand-to-pocket movements with reduced logging.
     """
     # Initialize your detection class with improved settings
+    # theft_detector = TheftDetector()
     theft_detector = TheftDetector(settings={
-        'confidence_threshold': 0.5,  # Lower threshold for better detection
-        'debug_mode': True,  # Enable debugging information
+        'confidence_threshold': 0.4,
+        'iou_threshold': 0.3,
+        'history_length': 5
     })
 
     def gen_frames():

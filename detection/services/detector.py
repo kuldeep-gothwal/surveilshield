@@ -1,364 +1,549 @@
-# detection/services/detector.py
 import cv2
 import numpy as np
 from ultralytics import YOLO
 import mediapipe as mp
-from datetime import datetime
-import logging
-import os
-
-# Set the environment variable to reduce YOLO's logging
-os.environ["YOLO_VERBOSE"] = "0"
-
-# Configure logging
-logging.basicConfig(level=logging.WARNING)  # Set to WARNING level to reduce logs
-logger = logging.getLogger(__name__)
+import time
 
 class TheftDetector:
     def __init__(self, settings=None):
-        self.settings = settings or {}
+        if settings is None:
+            settings = {}
         
-        # Initialize YOLO model for object detection with reduced verbosity
-        self.yolo_model = YOLO('yolov8n.pt')
+        # Initialize YOLO model
+        self.yolo_model = YOLO(settings.get('model_path', 'yolov8n.pt'))
         
-        # Initialize MediaPipe for pose estimation
+        # Initialize MediaPipe Pose
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=settings.get('pose_detection_confidence', 0.5),
+            min_tracking_confidence=settings.get('pose_tracking_confidence', 0.5)
         )
         
         # Detection thresholds
-        self.confidence_threshold = self.settings.get('confidence_threshold', 0.5)  # Lowered for better detection
+        self.confidence_threshold = settings.get('confidence_threshold', 0.5)
+        self.iou_threshold = settings.get('iou_threshold', 0.5)
         
-        # Track if objects of interest are close to hands
-        self.object_hand_proximity = {}
-        
-        # Track objects near pockets
-        self.objects_near_pocket = {}
-        
-        # Define which YOLO class IDs we care about 
-        # 0: person, 45: banana, 67: cell phone
-        self.target_object_classes = [45, 67]  
-        
-        # Define meaningful names for the class IDs
+        # Define target object classes with correct COCO dataset IDs
+        # banana=52, cell phone=67, watch=88, pen is custom (you'll need to train for this)
+        self.target_object_classes = [52, 67, 88]
+        if settings.get('include_pen', True):
+            # Assuming you've trained a custom model that includes pen
+            self.target_object_classes.append(999)  # custom class ID for pen
+            
+        # Class name mapping (update with correct class IDs from your model)
         self.class_name_map = {
-            0: "person",
-            45: "banana",
-            67: "cell phone"
+            0: "person", 
+            52: "banana", 
+            67: "cell phone", 
+            88: "watch",
+            999: "pen"  # custom class
         }
         
-        # For debugging
-        self.debug_mode = self.settings.get('debug_mode', True)
+        # History of detections for temporal smoothing
+        self.detection_history = []
+        self.history_length = settings.get('history_length', 5)
         
-        logger.info("Theft detector initialized with reduced logging")
-    
-    def detect_theft(self, frame, frame_id):
-        """Main detection function to analyze a frame for theft behavior."""
-        if frame is None:
-            return None
-        
-        # Step 1: Detect people and objects in the frame
-        detections = self._detect_objects(frame, verbose=False)  # Turn off verbose output
-        
-        # Step 2: Track or detect human poses
-        person_poses = self._detect_poses(frame)
-        
-        # Step 3: Analyze for suspicious movements - now checking if objects go to pocket
-        suspicious_actions = self._detect_suspicious_actions(detections, person_poses, frame)
-        
-        results = {
-            'frame_id': frame_id,
-            'timestamp': datetime.now().isoformat(),
-            'detections': detections,
-            'suspicious_actions': suspicious_actions,
-            'alert': bool(suspicious_actions)  # If there's any suspicious action, raise alert
+        # Regions of interest definitions (relative to body landmarks)
+        self.region_definitions = {
+            'upper_chest_pocket': {
+                'landmarks': [11, 12],  # shoulders
+                'x_offset': 0,
+                'y_offset': 0.05,
+                'width_factor': 0.15,
+                'height_factor': 0.1
+            },
+            'lower_chest_pocket': {
+                'landmarks': [11, 12],  # shoulders
+                'x_offset': 0,
+                'y_offset': 0.1,
+                'width_factor': 0.15,
+                'height_factor': 0.1
+            },
+            'left_waist_pocket': {
+                'landmarks': [23, 11],  # left hip, left shoulder
+                'x_offset': -0.02,
+                'y_offset': 0.1,
+                'width_factor': 0.15,
+                'height_factor': 0.15
+            },
+            'right_waist_pocket': {
+                'landmarks': [24, 12],  # right hip, right shoulder
+                'x_offset': 0.02,
+                'y_offset': 0.1,
+                'width_factor': 0.15,
+                'height_factor': 0.15
+            },
+            'back_pocket': {
+                'landmarks': [23, 24],  # left hip, right hip
+                'x_offset': 0,
+                'y_offset': 0.1,
+                'width_factor': 0.3,
+                'height_factor': 0.15
+            }
         }
-        
-        return results
-    
-    def _detect_objects(self, frame, verbose=False):
-        """Detect people and target objects using YOLO."""
-        # Add person (0) to our list of target classes for detection
-        detection_classes = [0] + self.target_object_classes
-        
-        # Run detection with verbose=False to reduce console output
-        results = self.yolo_model(frame, classes=detection_classes, verbose=verbose)
-        
+
+    def detect_objects(self, frame):
+        """
+        Detect target objects in the frame using YOLO
+        """
+        results = self.yolo_model(frame)
         detections = []
+        
         for result in results:
-            boxes = result.boxes.xyxy.cpu().numpy()  # x1, y1, x2, y2
+            boxes = result.boxes.xyxy.cpu().numpy()
             confidences = result.boxes.conf.cpu().numpy()
             class_ids = result.boxes.cls.cpu().numpy().astype(int)
             
-            for box, confidence, class_id in zip(boxes, confidences, class_ids):
-                if confidence > self.confidence_threshold:
-                    # Get object name from our class map
-                    obj_type = self.class_name_map.get(class_id, "unknown")
-                    
+            for box, conf, class_id in zip(boxes, confidences, class_ids):
+                if conf > self.confidence_threshold and class_id in self.target_object_classes:
                     detections.append({
-                        'type': obj_type,
+                        'type': self.class_name_map.get(class_id, 'unknown'),
                         'box': box.tolist(),
-                        'confidence': float(confidence),
-                        'class_id': int(class_id)
+                        'confidence': float(conf),
+                        'class_id': int(class_id),
+                        'center': [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2],
+                        'area': (box[2] - box[0]) * (box[3] - box[1])
                     })
         
         return detections
-    
-    def _detect_poses(self, frame):
-        """Detect human poses using MediaPipe."""
+
+    def detect_poses(self, frame):
+        """
+        Detect body poses in the frame using MediaPipe
+        Fixed to handle the missing 'score' field error
+        """
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pose_results = self.pose.process(rgb_frame)
+        result = self.pose.process(rgb_frame)
         
-        poses = []
-        if pose_results.pose_landmarks:
-            # For now, we assume only one person. If multiple people exist, you'd adapt logic.
-            for idx, landmarks in enumerate([pose_results.pose_landmarks]):
-                pose_data = {
-                    'id': idx,
-                    'landmarks': {}
-                }
-                
-                if landmarks:
-                    for i, landmark in enumerate(landmarks.landmark):
-                        pose_data['landmarks'][i] = {
-                            'x': landmark.x,
-                            'y': landmark.y,
-                            'z': landmark.z,
-                            'visibility': landmark.visibility
-                        }
-                
-                poses.append(pose_data)
+        if not result.pose_landmarks:
+            return []
         
-        return poses
-    
-    def _get_center_of_box(self, box):
-        """Calculate the center point of a bounding box."""
-        return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
-    
-    def _is_hand_holding_object(self, hand_landmark, object_box, frame_shape):
-        """Check if a hand is holding/near an object."""
-        # Convert normalized hand coordinates to pixel coordinates
-        hand_x = int(hand_landmark['x'] * frame_shape[1])
-        hand_y = int(hand_landmark['y'] * frame_shape[0])
+        pose_data = []
+        landmarks = result.pose_landmarks.landmark
         
-        # Check if hand is inside or very close to object bounding box
-        # Add a larger margin around the box for better detection
-        margin = 50  # Increased margin for better detection
-        if (hand_x >= object_box[0] - margin and 
-            hand_x <= object_box[2] + margin and
-            hand_y >= object_box[1] - margin and 
-            hand_y <= object_box[3] + margin):
-            return True
+        # Convert landmarks to dictionary format
+        landmarks_dict = {i: {'x': lm.x, 'y': lm.y, 'z': lm.z, 'visibility': lm.visibility} 
+                         for i, lm in enumerate(landmarks)}
         
-        return False
-    
-    def _is_object_near_pocket(self, object_box, hip_landmark, frame_shape):
-        """Check if an object is near the hip/pocket area."""
-        # Convert normalized hip coordinates to pixel coordinates
-        hip_x = int(hip_landmark['x'] * frame_shape[1])
-        hip_y = int(hip_landmark['y'] * frame_shape[0])
+        # Create pose data without trying to access the score field
+        pose_data.append({
+            'id': 0,
+            'landmarks': landmarks_dict,
+            # Don't try to access 'score' field since it doesn't exist
+        })
         
-        # Get object center
-        obj_center_x, obj_center_y = self._get_center_of_box(object_box)
-        
-        # Define a larger pocket region (significantly expanded for better detection)
-        pocket_region_x_min = hip_x - 150  # Expanded left range
-        pocket_region_x_max = hip_x + 100  # Expanded right range
-        pocket_region_y_min = hip_y - 50   # Expanded up range
-        pocket_region_y_max = hip_y + 150  # Expanded down range
-        
-        # Check if object center is in pocket region
-        if (obj_center_x >= pocket_region_x_min and 
-            obj_center_x <= pocket_region_x_max and
-            obj_center_y >= pocket_region_y_min and 
-            obj_center_y <= pocket_region_y_max):
-            return True
-        
-        return False
-    
-    def _detect_suspicious_actions(self, detections, poses, frame):
+        return pose_data
+
+    def calculate_region_of_interest(self, region_def, landmarks, frame_shape):
         """
-        Analyze if target objects (banana, phone) are being placed into pockets.
+        Calculate a region of interest based on body landmarks
         """
-        suspicious_actions = []
+        frame_w, frame_h = frame_shape[1], frame_shape[0]
         
-        if not poses or not detections:
-            return suspicious_actions
+        # Get reference landmarks
+        ref_landmarks = [landmarks.get(lm_id) for lm_id in region_def['landmarks']]
+        if any(lm is None for lm in ref_landmarks):
+            return None
         
-        # Get frame dimensions for coordinate conversion
-        frame_height, frame_width = frame.shape[:2]
-        frame_shape = (frame_height, frame_width)
+        # Calculate center point
+        center_x = sum(lm['x'] for lm in ref_landmarks) / len(ref_landmarks)
+        center_y = sum(lm['y'] for lm in ref_landmarks) / len(ref_landmarks)
         
-        # Filter out target objects (banana, cell phone) and people
-        target_objects = [d for d in detections if d['class_id'] in self.target_object_classes]
-        people = [d for d in detections if d['type'] == 'person']
+        # Apply offsets
+        center_x += region_def['x_offset']
+        center_y += region_def['y_offset']
         
-        # If no target objects or people, return early
-        if not target_objects or not people:
-            return suspicious_actions
+        # Convert to pixel coordinates
+        center_x = int(center_x * frame_w)
+        center_y = int(center_y * frame_h)
         
-        # For each person pose
+        # Calculate width and height
+        box_width = int(region_def['width_factor'] * frame_w)
+        box_height = int(region_def['height_factor'] * frame_h)
+        
+        # Create bounding box [x1, y1, x2, y2]
+        return [
+            center_x - box_width // 2, 
+            center_y - box_height // 2,
+            center_x + box_width // 2, 
+            center_y + box_height // 2
+        ]
+
+    def calculate_all_regions(self, pose, frame_shape):
+        """
+        Calculate all defined regions of interest for a pose
+        """
+        landmarks = pose['landmarks']
+        regions = {}
+        
+        for name, region_def in self.region_definitions.items():
+            region_box = self.calculate_region_of_interest(region_def, landmarks, frame_shape)
+            if region_box:
+                regions[name] = region_box
+                
+        # Add additional dynamic regions
+        
+        # Sleeve regions based on elbow and wrist positions
+        if all(landmarks.get(lm_id) for lm_id in [13, 15]):  # left elbow, left wrist
+            left_elbow = landmarks[13]
+            left_wrist = landmarks[15]
+            sleeve_x = (left_elbow['x'] + left_wrist['x']) / 2
+            sleeve_y = (left_elbow['y'] + left_wrist['y']) / 2
+            sleeve_x = int(sleeve_x * frame_shape[1])
+            sleeve_y = int(sleeve_y * frame_shape[0])
+            sleeve_width = int(0.1 * frame_shape[1])
+            sleeve_height = int(0.15 * frame_shape[0])
+            regions['left_sleeve'] = [
+                sleeve_x - sleeve_width // 2,
+                sleeve_y - sleeve_height // 2,
+                sleeve_x + sleeve_width // 2,
+                sleeve_y + sleeve_height // 2
+            ]
+            
+        if all(landmarks.get(lm_id) for lm_id in [14, 16]):  # right elbow, right wrist
+            right_elbow = landmarks[14]
+            right_wrist = landmarks[16]
+            sleeve_x = (right_elbow['x'] + right_wrist['x']) / 2
+            sleeve_y = (right_elbow['y'] + right_wrist['y']) / 2
+            sleeve_x = int(sleeve_x * frame_shape[1])
+            sleeve_y = int(sleeve_y * frame_shape[0])
+            sleeve_width = int(0.1 * frame_shape[1])
+            sleeve_height = int(0.15 * frame_shape[0])
+            regions['right_sleeve'] = [
+                sleeve_x - sleeve_width // 2,
+                sleeve_y - sleeve_height // 2,
+                sleeve_x + sleeve_width // 2,
+                sleeve_y + sleeve_height // 2
+            ]
+            
+        # Upper back region
+        if all(landmarks.get(lm_id) for lm_id in [11, 12, 23, 24]):  # shoulders and hips
+            back_x = (landmarks[11]['x'] + landmarks[12]['x']) / 2
+            back_y = (landmarks[11]['y'] + landmarks[12]['y'] + landmarks[23]['y'] + landmarks[24]['y']) / 4
+            back_x = int(back_x * frame_shape[1])
+            back_y = int(back_y * frame_shape[0])
+            back_width = int(0.2 * frame_shape[1])
+            back_height = int(0.25 * frame_shape[0])
+            regions['upper_back'] = [
+                back_x - back_width // 2,
+                back_y - back_height // 2,
+                back_x + back_width // 2,
+                back_y + back_height // 2
+            ]
+            
+        # Mid back region
+        if all(landmarks.get(lm_id) for lm_id in [23, 24]):  # left hip, right hip
+            mid_back_x = (landmarks[23]['x'] + landmarks[24]['x']) / 2
+            mid_back_y = (landmarks[23]['y'] + landmarks[24]['y']) / 2 - 0.05
+            mid_back_x = int(mid_back_x * frame_shape[1])
+            mid_back_y = int(mid_back_y * frame_shape[0])
+            mid_back_width = int(0.2 * frame_shape[1])
+            mid_back_height = int(0.15 * frame_shape[0])
+            regions['mid_back'] = [
+                mid_back_x - mid_back_width // 2,
+                mid_back_y - mid_back_height // 2,
+                mid_back_x + mid_back_width // 2,
+                mid_back_y + mid_back_height // 2
+            ]
+        
+        return regions
+
+    def calculate_iou(self, box1, box2):
+        """
+        Calculate Intersection over Union between two bounding boxes
+        """
+        # Determine the coordinates of the intersection rectangle
+        x_left = max(box1[0], box2[0])
+        y_top = max(box1[1], box2[1])
+        x_right = min(box1[2], box2[2])
+        y_bottom = min(box1[3], box2[3])
+
+        # If there's no intersection, return 0
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+
+        # Calculate intersection area
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+
+        # Calculate union area
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union_area = box1_area + box2_area - intersection_area
+
+        # Calculate IoU
+        return intersection_area / union_area if union_area > 0 else 0.0
+
+    def is_object_hidden(self, obj_box, regions):
+        """
+        Determine if an object is hidden in any body region
+        """
+        for region_name, region_box in regions.items():
+            iou = self.calculate_iou(obj_box, region_box)
+            if iou > self.iou_threshold:
+                return True, region_name
+                
+        return False, None
+
+    def check_proximity_to_landmarks(self, obj_center, pose, frame_shape):
+        """
+        Check if an object is in proximity to specific body landmarks
+        """
+        frame_w, frame_h = frame_shape[1], frame_shape[0]
+        landmarks = pose['landmarks']
+        obj_x, obj_y = obj_center
+        
+        # Define landmark IDs and their corresponding body parts
+        landmark_regions = {
+            0: "nose",
+            7: "left ear",
+            8: "right ear",
+            9: "mouth_left",
+            10: "mouth_right",
+            15: "left wrist",
+            16: "right wrist",
+            19: "left hand",
+            20: "right hand",
+            23: "left hip",
+            24: "right hip",
+            25: "left knee",
+            26: "right knee",
+            27: "left ankle",
+            28: "right ankle"
+        }
+        
+        # Check proximity to each landmark
+        proximity_threshold = 0.08 * max(frame_w, frame_h)  # Dynamic threshold based on frame size
+        
+        for lm_id, region_name in landmark_regions.items():
+            lm = landmarks.get(lm_id)
+            if lm:
+                lm_x, lm_y = lm['x'] * frame_w, lm['y'] * frame_h
+                distance = np.sqrt((lm_x - obj_x)**2 + (lm_y - obj_y)**2)
+                if distance < proximity_threshold:
+                    return True, region_name
+                    
+        return False, None
+
+    def detect_theft(self, frame, frame_id):
+        """
+        Main detection function for theft/hiding behavior
+        """
+        frame_shape = frame.shape
+        detections = self.detect_objects(frame)
+        poses = self.detect_poses(frame)
+        
+        # Initialize results
+        results = {
+            'frame_id': frame_id,
+            'detections': detections,
+            'suspicious_actions': [],
+            'alert': False
+        }
+        
+        if not poses:
+            return results
+            
         for pose in poses:
-            if not pose['landmarks']:
-                continue
-                
-            # Get wrist and hip landmarks (both sides)
-            left_wrist = pose['landmarks'].get(15)
-            right_wrist = pose['landmarks'].get(16)
-            left_hip = pose['landmarks'].get(23)
-            right_hip = pose['landmarks'].get(24)
+            # Calculate all regions of interest for this pose
+            regions = self.calculate_all_regions(pose, frame_shape)
             
-            # If landmarks not visible, skip
-            if not (left_wrist and right_wrist and left_hip and right_hip):
-                continue
-            
-            # For each target object (banana, phone)
-            for obj in target_objects:
-                object_id = f"{obj['type']}_{obj['box'][0]}_{obj['box'][1]}"
-                
-                # Check if either hand is holding/near the object
-                left_hand_holding = self._is_hand_holding_object(left_wrist, obj['box'], frame_shape)
-                right_hand_holding = self._is_hand_holding_object(right_wrist, obj['box'], frame_shape)
-                
-                # Check if object is near either pocket
-                left_pocket_proximity = self._is_object_near_pocket(obj['box'], left_hip, frame_shape)
-                right_pocket_proximity = self._is_object_near_pocket(obj['box'], right_hip, frame_shape)
-                
-                # Track this object's state
-                if object_id not in self.object_hand_proximity:
-                    self.object_hand_proximity[object_id] = False
-                
-                if object_id not in self.objects_near_pocket:
-                    self.objects_near_pocket[object_id] = False
-                
-                # Update tracking 
-                is_hand_holding = left_hand_holding or right_hand_holding
-                is_near_pocket = left_pocket_proximity or right_pocket_proximity
-                
-                # Detect suspicious action: Object was near hand and is now near pocket
-                # This suggests the item is being placed into a pocket
-                if is_near_pocket:  # Simplified to just check if near pocket for easier detection
-                    suspicious_actions.append({
-                        'type': 'object_to_pocket',
-                        'object': obj['type'],
-                        'side': 'left' if left_pocket_proximity else 'right',
-                        'confidence': 0.9,
-                        'pose_id': pose['id']
-                    })
-                
-                # Update tracking state for next frame
-                self.object_hand_proximity[object_id] = is_hand_holding
-                self.objects_near_pocket[object_id] = is_near_pocket
+            # Check each detected object
+            for obj in detections:
+                if obj['type'] in ["banana", "cell phone", "watch", "pen"]:
+                    # Check if object is in any of the defined regions
+                    hidden, location = self.is_object_hidden(obj['box'], regions)
+                    
+                    if hidden:
+                        suspicious_action = {
+                            'object': obj['type'],
+                            'location': location,
+                            'confidence': obj['confidence'],
+                            'box': obj['box']
+                        }
+                        results['suspicious_actions'].append(suspicious_action)
+                    else:
+                        # Check proximity to landmarks as fallback
+                        near, landmark = self.check_proximity_to_landmarks(obj['center'], pose, frame_shape)
+                        if near:
+                            # Only consider proximity as hiding if near certain body parts
+                            if landmark in ["left hip", "right hip", "left hand", "right hand", "left wrist", "right wrist"]:
+                                suspicious_action = {
+                                    'object': obj['type'],
+                                    'location': f"near {landmark}",
+                                    'confidence': obj['confidence'],
+                                    'box': obj['box']
+                                }
+                                results['suspicious_actions'].append(suspicious_action)
         
-        return suspicious_actions
-    
+        # Update alert status
+        results['alert'] = len(results['suspicious_actions']) > 0
+        
+        # Add to history for temporal smoothing
+        self.detection_history.append(results)
+        if len(self.detection_history) > self.history_length:
+            self.detection_history.pop(0)
+            
+        # Apply temporal smoothing (reduce false positives)
+        if len(self.detection_history) >= 3:
+            # Only alert if we've seen suspicious activity in multiple consecutive frames
+            consecutive_alerts = sum(1 for r in self.detection_history[-3:] if r['alert'])
+            results['alert'] = consecutive_alerts >= 2
+            
+        return results
+
     def annotate_frame(self, frame, results):
-        """Draw bounding boxes and suspicious alerts on the frame for visualization."""
-        if not results:
-            return frame
-        
+        """
+        Draw detection results on the frame
+        """
         annotated = frame.copy()
         
-        # Draw bounding boxes for all detections
-        for detection in results.get('detections', []):
-            box = detection['box']
-            
-            # Different colors based on object type
-            if detection['type'] == 'person':
-                color = (0, 255, 0)  # Green for people
-            elif detection['type'] == 'banana':
+        # Draw object detections
+        for det in results['detections']:
+            # Different colors for different object types
+            if det['type'] == "person":
+                color = (0, 255, 0)  # Green for person
+            elif det['type'] == "watch":
+                color = (255, 0, 0)  # Blue for watch
+            elif det['type'] == "cell phone":
+                color = (0, 0, 255)  # Red for phone
+            elif det['type'] == "banana":
                 color = (0, 255, 255)  # Yellow for banana
-            elif detection['type'] == 'cell phone':
-                color = (255, 0, 255)  # Purple for phone
+            elif det['type'] == "pen":
+                color = (255, 0, 255)  # Purple for pen
             else:
-                color = (255, 0, 0)  # Red for other objects
-            
-            # Draw the bounding box
-            cv2.rectangle(
-                annotated, 
-                (int(box[0]), int(box[1])), 
-                (int(box[2]), int(box[3])), 
-                color, 
-                2
-            )
-            
-            # Label the object with confidence
-            label = f"{detection['type']} ({detection['confidence']:.2f})"
-            cv2.putText(
-                annotated,
-                label,
-                (int(box[0]), int(box[1]) - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2
-            )
-            
-        # Highlight suspicious actions
-        if results.get('suspicious_actions'):
-            # Draw a more prominent alert with background
-            alert_text = "SUSPICIOUS ACTION DETECTED"
-            
-            # Create background rectangle for better visibility
-            text_size = cv2.getTextSize(alert_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 3)[0]
-            cv2.rectangle(
-                annotated,
-                (45, 35),
-                (45 + text_size[0] + 10, 55),
-                (0, 0, 0),
-                -1  # Fill the rectangle
-            )
-            
-            # Draw the alert text
-            cv2.putText(
-                annotated,
-                alert_text,
-                (50, 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 0, 255),  # Red color
-                3
-            )
-            
-            # Add more details about what was detected
-            for i, action in enumerate(results.get('suspicious_actions', [])):
-                message = f"{action['object']} to {action['side']} pocket!"
+                color = (255, 255, 255)  # White for unknown
                 
-                # Create background for this message too
-                msg_size = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-                cv2.rectangle(
-                    annotated,
-                    (45, 75 + (i * 30)),
-                    (45 + msg_size[0] + 10, 95 + (i * 30)),
-                    (0, 0, 0),
-                    -1
-                )
-                
-                # Draw the message
-                cv2.putText(
-                    annotated,
-                    message,
-                    (50, 90 + (i * 30)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 0, 255),
-                    2
-                )
+            box = det['box']
+            cv2.rectangle(annotated, 
+                         (int(box[0]), int(box[1])), 
+                         (int(box[2]), int(box[3])), 
+                         color, 2)
             
-        return annotated
-    
-    # Add a method to process a single image for debugging
-    def process_test_image(self, image_path):
-        """Process a single test image for debugging."""
-        frame = cv2.imread(image_path)
-        if frame is None:
-            logger.error(f"Could not read image: {image_path}")
-            return None
-            
-        results = self.detect_theft(frame, 0)
-        annotated = self.annotate_frame(frame, results)
+            # Draw label
+            label = f"{det['type']} {det['confidence']:.2f}"
+            cv2.putText(annotated, label,
+                       (int(box[0]), int(box[1]) - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
+        # Draw suspicious actions
+        for i, action in enumerate(results['suspicious_actions']):
+            text = f"ALERT: {action['object']} hidden in {action['location']}"
+            cv2.putText(annotated, text, 
+                       (30, 60 + i * 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            # Draw box around hidden object with warning color
+            if 'box' in action:
+                box = action['box']
+                # Pulsating effect for alert boxes
+                thickness = 3 + (int(time.time() * 5) % 3)
+                cv2.rectangle(annotated, 
+                             (int(box[0]), int(box[1])), 
+                             (int(box[2]), int(box[3])), 
+                             (0, 0, 255), thickness)
+        
+        # Add alert banner if suspicious activity detected
+        if results['alert']:
+            cv2.rectangle(annotated, (0, 0), (annotated.shape[1], 40), (0, 0, 255), -1)
+            cv2.putText(annotated, "SUSPICIOUS ACTIVITY DETECTED", 
+                       (annotated.shape[1]//2 - 180, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        return annotated
+
+    def process_frame(self, frame, frame_id=0):
+        """
+        Process a single frame
+        """
+        results = self.detect_theft(frame, frame_id)
+        annotated = self.annotate_frame(frame, results)
         return annotated, results
+
+    def process_video(self, video_path, output_path=None):
+        """
+        Process a video file
+        """
+        cap = cv2.VideoCapture(video_path)
+        frame_id = 0
+        
+        # Set up video writer if output path is provided
+        if output_path:
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            annotated, results = self.process_frame(frame, frame_id)
+            
+            if output_path:
+                out.write(annotated)
+                
+            cv2.imshow('Theft Detection', annotated)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+                
+            frame_id += 1
+        
+        cap.release()
+        if output_path:
+            out.release()
+        cv2.destroyAllWindows()
+        
+    def process_test_image(self, image_path):
+        """
+        Process a single test image
+        """
+        image = cv2.imread(image_path)
+        if image is None:
+            return None, None
+            
+        return self.process_frame(image)
+
+def run_camera_detection():
+    """
+    Run the theft detector with webcam input
+    """
+    detector = TheftDetector(settings={
+        'confidence_threshold': 0.4,
+        'iou_threshold': 0.3,
+        'history_length': 5
+    })
+    
+    cap = cv2.VideoCapture(0)
+    frame_id = 0
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        annotated, results = detector.process_frame(frame, frame_id)
+        
+        cv2.imshow('Theft Detection', annotated)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+            
+        frame_id += 1
+        
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    # Choose one of the following options:
+    
+    # Option 1: Run with webcam
+    run_camera_detection()
+    
+    # Option 2: Process a video file
+    # detector = TheftDetector()
+    # detector.process_video("test_video.mp4", "output_video.mp4")
+    
+    # Option 3: Process a test image
+    # detector = TheftDetector()
+    # detector.process_test_image("test_image.jpg")
