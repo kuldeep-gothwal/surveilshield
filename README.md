@@ -1,10 +1,10 @@
-# 🎯 SurveilShield
+#  SurveilShield
 
 **SurveilShield** is an AI-powered CCTV application built with **Python** and **Django** to detect suspicious actions in a canteen setting — like slipping items into a pocket — in **real time** using computer vision.
 
 ---
 
-## 🚀 Features
+##  Features
 - Real-time CCTV feed analysis
 - Detects item concealment & abnormal actions
 - **YOLOv8 + MediaPipe** for object & gesture detection
@@ -14,7 +14,7 @@
 
 ---
 
-## 🧱 Tech Stack
+##  Tech Stack
 - **Backend:** Python, Django, Django REST Framework, Channels, Celery, Redis
 - **AI/ML:** OpenCV, Ultralytics YOLOv8, MediaPipe, TensorFlow/PyTorch
 - **Database:** MySQL / PostgreSQL
@@ -22,7 +22,7 @@
 
 ---
 
-## 📦 Installation
+##  Installation
 ```bash
 git clone https://github.com/<your-username>/surveilshield.git
 cd surveilshield
